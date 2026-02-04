@@ -219,6 +219,155 @@ console.log('提取的用户信息:', final.value?.result);
 - LangChain 的 Chain 可以嵌入到 LangGraph 的 Node 中使用
 - LangGraph 的状态管理更复杂，需要定义 StateSchema
 
+### 本项目使用的流式方式和 SSE (Server-Sent Events) 有什么区别？
+
+本项目使用的不是 SSE，而是 **LangChain 的流式 API**，两者有本质区别。
+
+#### 技术架构对比
+
+| 特性 | 本项目 (LangChain 流式) | SSE (Server-Sent Events) |
+|------|------------------------|-------------------------|
+| **技术实现** | LangChain `ollama.stream()` 返回 AsyncGenerator，使用 `for await...of` 迭代 | HTTP 长连接 + EventSource API，服务器推送 `text/event-stream` 格式数据 |
+| **通信方向** | 客户端主动请求 + 服务端流式响应 | 服务端主动推送（单向） |
+| **连接方式** | 客户端直接调用 Ollama API，通过 LangChain 封装 | 客户端建立持久 HTTP 连接到服务器 |
+| **数据格式** | LangChain 标准化流式块，解析思考过程和内容 | SSE 标准格式 (`data: ...\n\n`) |
+| **代码示例** | `for await (const chunk of await ollama.stream(messages)) { ... }` | `const eventSource = new EventSource('/api/stream'); eventSource.onmessage = ...` |
+| **后端需求** | 不需要后端服务器（客户端直连 Ollama） | 需要后端服务器实现 SSE 端点 |
+| **跨域支持** | 客户端直接请求，受 CORS 限制 | 原生支持跨域 |
+| **重连机制** | 需要手动实现 | 自动重连（内置机制） |
+| **适用场景** | 本地开发、简单应用、无需中转 | 生产环境、需要鉴权、需要统一管理 |
+
+#### 代码实现对比
+
+**本项目使用的 LangChain 流式方式：**
+
+```typescript
+// src/lib/langchain.ts
+export const chatStream = async function* (
+  content: string,
+  systemPrompt?: string
+): AsyncGenerator<StreamChunk> {
+  const messages = [
+    new SystemMessage(systemPrompt || '你是一个AI助手'),
+    new HumanMessage(content),
+  ];
+
+  const ollama = getOllamaInstance();
+
+  // 使用 LangChain 的 stream API
+  for await (const chunk of await ollama.stream(messages)) {
+    const chunks = parseStreamChunk(chunk);
+    for (const c of chunks) {
+      yield c;
+    }
+  }
+};
+
+// src/hooks/useChat.ts
+const stream = chatStream(userMessage, options.systemPrompt);
+for await (const chunk of stream) {
+  if (chunk.type === 'thinking') {
+    thinking += chunk.content;
+    setStreamingThinking(thinking);
+  } else {
+    response += chunk.content;
+    setStreamingResponse(response);
+  }
+}
+```
+
+**SSE 实现方式（如果使用 SSE）：**
+
+```typescript
+// 前端：使用 EventSource API
+const eventSource = new EventSource('http://localhost:3000/api/stream');
+
+eventSource.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if (data.type === 'thinking') {
+    setStreamingThinking(prev => prev + data.content);
+  } else if (data.type === 'content') {
+    setStreamingResponse(prev => prev + data.content);
+  }
+};
+
+eventSource.onerror = (error) => {
+  console.error('SSE error:', error);
+  eventSource.close();
+};
+
+// 后端：Node.js + Express 实现 SSE
+app.get('/api/stream', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const stream = await ollama.stream(messages);
+
+  try {
+    for await (const chunk of stream) {
+      // 转换为 SSE 格式
+      const data = JSON.stringify({
+        type: chunk.type,
+        content: chunk.content,
+      });
+      res.write(`data: ${data}\n\n`);
+    }
+    res.write('event: done\ndata: {}\n\n');
+  } catch (error) {
+    res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+  } finally {
+    res.end();
+  }
+});
+```
+
+#### SSE 数据格式示例
+
+SSE 协议要求特定的格式：
+
+```
+data: {"type":"thinking","content":"我需要分析这个问题..."}\n\n
+data: {"type":"content","content："根据你的问题，"}\n\n
+data: {"type":"content","content："我可以给出以下建议："}\n\n
+event: done\ndata: {}\n\n
+```
+
+每条消息必须以 `\n\n` 结尾，`data:` 前缀表示数据内容，`event:` 前缀表示事件类型。
+
+#### 本项目选择 LangChain 流式的原因
+
+1. **架构简单**：客户端直连 Ollama，无需后端服务器
+2. **开发效率**：快速原型，无需实现 SSE 服务器
+3. **本地优先**：适合本地开发和个人使用
+4. **LangChain 封装**：自动处理模型差异、思考过程解析等复杂逻辑
+
+#### 何时应该使用 SSE
+
+| 场景 | 推荐方案 | 原因 |
+|------|---------|------|
+| 本地开发、个人项目 | LangChain 流式 | 架构简单，无需后端 |
+| 生产环境部署 | SSE | 统一管理、鉴权、监控 |
+| 多用户访问 | SSE | 避免 CORS 问题，统一流量控制 |
+| 需要鉴权/限流 | SSE | 后端可以统一控制 |
+| 客户端复杂逻辑 | SSE | 后端处理复杂逻辑，前端只负责展示 |
+| 嵌入第三方应用 | SSE | 更好的安全性控制 |
+
+#### SSE 的优势
+
+- **自动重连**：网络断开后自动重新连接
+- **事件类型**：支持不同类型的事件（`event: done`, `event: error` 等）
+- **服务器推送**：真正的服务端推送，无需客户端轮询
+- **标准化**：W3C 标准，浏览器原生支持
+- **轻量级**：比 WebSocket 更轻量，适合单向数据流
+
+#### SSE 的局限性
+
+- **单向通信**：只能从服务器到客户端，客户端无法发送数据
+- **连接数限制**：浏览器对同一域名的 SSE 连接数有限制
+- **需要后端**：必须实现后端服务器来处理 SSE 请求
+- **CORS 处理**：跨域场景需要额外的 CORS 配置
+
 ### ollama.stream 和 Ollama's native streaming API 有什么区别？
 
 | 特性     | ollama.stream (LangChain) | Ollama Native API     |
